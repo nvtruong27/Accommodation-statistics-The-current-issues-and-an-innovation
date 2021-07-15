@@ -1,0 +1,681 @@
+---
+title: "Bootstrap and count regression"
+author: "Nguyen Van Truong"
+date: "12/17/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+rm(list=ls()) ## Clear the environment
+```
+
+Loading libraries:
+```{r}
+library(psych)
+library(ggplot2)
+library(ggExtra)
+library(dplyr)
+library(MASS)
+library(reshape2)
+library(glmmTMB)
+library(simstudy)
+
+```
+
+### 1. Simulate the dependence of variance on the mean value (Variance-Mean value)
+(Figure 1)
+## 1.1 Simulate Variance-Mean dependency for count (Poisson and NB) data
+```{r}
+
+variance_mean <- lapply(as.list(as.integer(seq.int(from =  10, to = 2500, length.out = 350))), # the range of sample mean
+                   function(i){
+                     i = i # the mean of the distribution
+                     v <- list()
+                     for(j in list(1e-20,0.01,0.1, 1.00,2.00,4)){ # dispersion parametter d in negbin; d = 1e-20 denotes for the case that NB approximate Poisson
+                       j = j
+                       # variance will be mean+d*mean2
+                       Variance <- i + j*(i^2)
+                       
+                       v0 <- cbind(Mean = i,
+                                  Dispersion = j,
+                                  Variance = Variance)
+                       v[[as.character(j)]] <- v0
+                       
+                     }
+                     vm <- as.data.frame(do.call(rbind, v))
+                     
+                     
+                     })
+variance_mean <- as.data.frame(do.call(rbind, variance_mean))
+# Names the types of distribution
+variance_mean$Distribution <- variance_mean$Dispersion
+variance_mean[variance_mean$Dispersion==1e-20,]$Distribution <- "Poisson" # Poisson is approximate NP when d is very small
+variance_mean[variance_mean$Dispersion==0.01,]$Distribution <- "NegBinomial, d = 0.01"
+variance_mean[variance_mean$Dispersion==0.1,]$Distribution <- "NegBinomial, d = 0.1"
+
+variance_mean[variance_mean$Dispersion==1,]$Distribution <- "NegBinomial, d = 1"
+variance_mean[variance_mean$Dispersion==2,]$Distribution <- "NegBinomial, d = 2"
+variance_mean[variance_mean$Dispersion==4,]$Distribution <- "NegBinomial, d = 4"
+```
+
+## 1.2 Simulate Variance-Mean dependency for Gaussian data
+The variance of gaussian data does not depend on the mean value
+```{r}
+r<-0.0001 # Correlation coefficient
+# Generate a artificial data contained two variables of mean zero with no correlation (coefficient r very small)
+mean_var.nor <- data.frame(mvrnorm(n=100, mu=c(0, 0), Sigma=matrix(c(1, r, r, 1), nrow=2),  empirical=TRUE))
+# Create a Variance and Mean based on two variables with no correlation to demonstrate that for Gaussian, there is
+# no rule between Variance and the mean
+mean_var.nor$Variance <- round(7500*(mean_var.nor$X1-min(mean_var.nor$X1)), digits = 0) 
+mean_var.nor$Mean <- round(750*(mean_var.nor$X2-min(mean_var.nor$X2)), digits = 0) 
+# pairs.panels(mean_var.nor[,c(3,4)]) # Visualize the correlation between Variance and Mean of Gaussian data
+mean_var.nor$Unrestricted_Variance <- "Gaussian"
+```
+
+## 1.3 Figure 1 in the paper is visualized with following codes
+```{r}
+ggplot(data = variance_mean)+
+  geom_line(aes(x =Mean, y = Variance, color = Distribution), size = 0.75)+ #, linetype = Distribution
+  scale_color_manual(name = "",
+                       values = c("Poisson" ="gray",
+                                  "NegBinomial, d = 0.01"="#F8766D",
+                                  "NegBinomial, d = 0.1"="#7CAE00",
+                                  "NegBinomial, d = 1"="orange",
+                                  "NegBinomial, d = 2"="cyan", 
+                                  "NegBinomial, d = 4"="#C77CFF"))+ # change the order of legend labels
+  
+  coord_cartesian( xlim = c(0,2100), ylim = c(0,3e4), expand = TRUE, clip = "on")+
+  # Put case of normal
+  geom_point(data = mean_var.nor,aes(x =Mean, y = Variance, shape = "Gaussian"), 
+             color = "blue")+
+  
+  guides(shape=guide_legend("Distribution:", override.aes=list(shape=16, size = 2)))+ #Change the legend for Gaussian and change the order
+  theme_bw()+
+  theme(legend.box.spacing = unit(2, "mm"),
+        legend.spacing.y = unit(0,"mm"), legend.background = element_blank() )+
+  theme(axis.title.y = element_text(margin = margin(t = 0, r = 4, b = 0, l = 0, unit = "mm")))+
+  theme(axis.title.x = element_text(margin = margin(t = 3.0, r = 0, b = 0, l = 0, unit = "mm")))+
+  labs(x="Sample mean",
+       y="Variance")
+```
+
+
+### 2. Simulate the effect of sample rate (or size), extent of dispersion on the accuracy of population estimation (se of OERR) with linear estimator for count data
+(Figure 2)
+In the paper, I used 1000 bootstrap iterations for the simulation. This was time consuming.
+In this simulation, to save the time, I only use 100 bootstrap iterations. The results will look different to those in the paper. To reproduce the results as in the paper, please increase the bootstrap iterations
+
+With 100 bootstrap iterations, the simulation would take 70 seconds
+```{r}
+norm_skew.compare <- lapply(as.list(seq(from =  0.05, to = 1.00, length.out = 26)), # the sample rate
+                   function(i){
+                     i = i # the sample rate
+                     obs <- 10000 # number of observations or population
+                     lamda <- 2000 # mean of the outcome distribution
+                     nb <- list()
+                     nor <- list()
+                     for(j in list(1e-6,0.01,0.10,1.00,2.00,4.00)){ # dispersion parametter d in negbin:
+                       # variance will be mean+d*mean2
+                       def <- defData(varname = "outcome", dist = "negBinomial", 
+                                      formula = lamda, variance = j, id = "Acc_code")
+                       dat <- genData(obs, def)
+                       
+                       negbin.test <- lapply(as.list(seq(1:100)), # Number of Bootstrap replications in each sample rate i 
+                            function(h){
+                              h = h
+                              resam <- dat[sample(x = dat$Acc_code, size = nrow(dat), replace = FALSE),] 
+                              
+                              smp_size <- floor(i * nrow(resam)) # training set = 20%
+                              ## set the seed to make your partition reproducible
+                              # set.seed(123)
+                              train_ind <- base::sample(seq_len(nrow(resam)), size = smp_size)
+                              train <- (resam)[train_ind, ]
+                              test <- (resam)[-train_ind, ]
+                              
+                              # Linear estimator
+                              linear.estimator = sum(train$outcome)/nrow(train)
+                              est.guests.LE = linear.estimator*nrow(test)+sum(train$outcome)
+                              
+                              observed.guests = sum(test$outcome)+sum(train$outcome)
+                              
+                              m.performance =cbind(Sample.rate = i,
+                                                   Distribution = "NegBinomial",
+                                                   var.par = j,
+                                                   observed = observed.guests,
+                                                   est.guests.LE = est.guests.LE,
+                                                   
+                                                   # LE.diff.guests = est.guests.LE - observed.guests,
+                                                   LE.diff.ratio = (est.guests.LE - observed.guests)*100/observed.guests
+                                                     
+                                                   )
+                              m.performance
+                              
+                            })
+                       negbin.test <- do.call(rbind, negbin.test)
+                       nb[[as.character(j)]] <- negbin.test
+                       
+                       # Normal distribution
+                       outcome <- round(rnorm(obs, mean = lamda, sd = sqrt(lamda+j*lamda^2) ), digits = 0)
+                       Acc_code <- seq.int(from = 1, to = obs)
+                       dat <- data.frame(Acc_code = Acc_code,
+                                         outcome = outcome)
+                       
+                       norm.test <- lapply(as.list(seq(1:100)), # Number of Bootstrap replications in each sample rate i 
+                            function(h){
+                              h = h
+                              resam <- dat[sample(x = dat$Acc_code, size = nrow(dat), replace = FALSE),] 
+                              
+                              smp_size <- floor(i * nrow(resam)) # training set = 20%
+                              ## set the seed to make your partition reproducible
+                              # set.seed(123)
+                              train_ind <- base::sample(seq_len(nrow(resam)), size = smp_size)
+                              train <- (resam)[train_ind, ]
+                              test <- (resam)[-train_ind, ]
+                              
+                              # Linear estimator
+                              linear.estimator = sum(train$outcome)/nrow(train)
+                              est.guests.LE = linear.estimator*nrow(test)+sum(train$outcome)
+                              
+                              observed.guests = sum(test$outcome)+sum(train$outcome)
+                              
+                              m.performance =cbind(Sample.rate = i,
+                                                   Distribution = "Gaussian",
+                                                   var.par = j,
+                                                   observed = observed.guests,
+                                                   est.guests.LE = est.guests.LE,
+                                                   
+                                                   # LE.diff.guests = est.guests.LE - observed.guests,
+                                                   LE.diff.ratio = (est.guests.LE - observed.guests)*100/observed.guests
+                                                     
+                                                   )
+                              m.performance
+                              
+                            })
+                       norm.test <- do.call(rbind, norm.test)
+                       nor[[as.character(j)]] <- norm.test
+                       
+                     }
+                     nb <- as.data.frame(do.call(rbind, nb))
+                     nor <- as.data.frame(do.call(rbind, nor))
+                     output <- rbind(nb, nor)
+                     
+                     })
+norm_skew.compare <- as.data.frame(do.call(rbind, norm_skew.compare))
+# The following codes are to make sure the format of the results of the simulation
+norm_skew.compare$Sample.rate <- as.numeric(as.character(norm_skew.compare$Sample.rate))
+norm_skew.compare$Distribution <- as.character(norm_skew.compare$Distribution)
+norm_skew.compare$var.par <- as.character(norm_skew.compare$var.par)
+norm_skew.compare$observed <- as.numeric(as.character(norm_skew.compare$observed))
+norm_skew.compare$est.guests.LE <- as.numeric(as.character(norm_skew.compare$est.guests.LE))
+norm_skew.compare$LE.diff.ratio <- as.numeric(as.character(norm_skew.compare$LE.diff.ratio))
+
+```
+
+Standard error of the population estimation OERR will be estimated with the following codes
+```{r}
+norm_skew.compare.se <- norm_skew.compare %>% 
+  group_by(Sample.rate, 
+           Distribution,
+           var.par) %>% summarise(iterations = n(),
+                                  se.le = sd(LE.diff.ratio))
+# Defining the types of data
+norm_skew.compare.se$Distribution. <- norm_skew.compare.se$Distribution
+norm_skew.compare.se[(norm_skew.compare.se$var.par==1e-6&
+                       norm_skew.compare.se$Distribution != "Gaussian"),]$Distribution. <- "Poisson"
+norm_skew.compare.se[norm_skew.compare.se$var.par==0.01&
+                       norm_skew.compare.se$Distribution!="Gaussian",]$Distribution. <- "NegBinomial, d = 0.01"
+norm_skew.compare.se[norm_skew.compare.se$var.par==0.1&
+                       norm_skew.compare.se$Distribution!="Gaussian",]$Distribution. <- "NegBinomial, d = 0.1"
+norm_skew.compare.se[norm_skew.compare.se$var.par==1&
+                       norm_skew.compare.se$Distribution!="Gaussian",]$Distribution. <- "NegBinomial, d = 1"
+norm_skew.compare.se[norm_skew.compare.se$var.par==2&
+                       norm_skew.compare.se$Distribution!="Gaussian",]$Distribution. <- "NegBinomial, d = 2"
+norm_skew.compare.se[norm_skew.compare.se$var.par==4&
+                       norm_skew.compare.se$Distribution!="Gaussian",]$Distribution. <- "NegBinomial, d = 4"
+
+# Add some points A, B, C, D, E into the figure
+a<-norm_skew.compare.se[round(norm_skew.compare.se$Sample.rate,2)==0.20&
+                          norm_skew.compare.se$Distribution!="Gaussian",]
+a$name <- c("A","B","C","","D","E")
+a$xvalue <- round(a$Sample.rate, digits = 2)
+a$yvalue <- sprintf("%0.1f",round(a$se.le, digits = 1)) 
+```
+
+Figure 2 in the paper is visualized with following codes
+```{r}
+# This design is suitable to export to image600*400 dpi size
+ggplot(data = norm_skew.compare.se[norm_skew.compare.se$Distribution.!="Gaussian",], group = Distribution.)+
+  geom_line(aes(x =Sample.rate, y = se.le, linetype = Distribution., color = Distribution.), size = 0.75)+
+  
+  scale_linetype_discrete(name = "Distribution:",
+                          breaks = c("Poisson","NegBinomial, d = 0.01",
+                                     "NegBinomial, d = 0.1",
+                                     "NegBinomial, d = 1","NegBinomial, d = 2",
+                                     "NegBinomial, d = 4"))+ # change the order of legend labels
+  
+  scale_color_manual(name = "Distribution:",
+                       values = c("Poisson" ="gray",
+                                  "NegBinomial, d = 0.01"="#F8766D",
+                                  "NegBinomial, d = 0.1"="#7CAE00",
+                                  "NegBinomial, d = 1"="orange",
+                                  "NegBinomial, d = 2"="cyan", 
+                                  "NegBinomial, d = 4"="#C77CFF")
+                     )+ # change the order of legend labels
+  guides(linetype = FALSE)+ # remove legend of linetype
+  
+  geom_point(data = a[a$Distribution.!="Poisson",],
+             aes(x=Sample.rate, y = se.le), color = "black", size = 2)+
+  geom_text(data = a[a$Distribution.!="Poisson",],
+            aes(x=Sample.rate, y = se.le, label = name), hjust = -1, vjust = 0, color = "black")+
+
+  geom_text(data = a[a$Distribution.!="Poisson",],
+            aes(x=Sample.rate, y = 0, label = xvalue), hjust = 0.75, vjust = 2.75, color = "darkred", size = 3.5)+
+  geom_text(data = a[a$Distribution.!="Poisson",],
+            aes(x=0, y = se.le, label = yvalue ), hjust = 2.75, vjust = 0.25, color = "darkred", size = 3.5)+
+
+  coord_cartesian(xlim = c(0,1), ylim = c(0,max(norm_skew.compare.se$se.le)), clip = "off")+ # Helps text outside the plot area
+  geom_segment(aes(x = a$Sample.rate[1], y=0, xend=a$Sample.rate[1], yend=max(a$se.le)), color = "gray", size=0.05)+
+
+  geom_segment(data = a[a$Distribution.!="Poisson",],
+               aes(x = 0, y=a[a$var.par==0.01,]$se.le,
+                   xend=a$Sample.rate[1], yend=a[a$var.par==0.01,]$se.le), color = "gray", size=0.05)+
+  geom_segment(data = a[a$Distribution.!="Poisson",],
+               aes(x = 0, y=a[a$var.par==0.1,]$se.le,
+                   xend=a$Sample.rate[1], yend=a[a$var.par==0.1,]$se.le), color = "gray", size=0.05)+
+  geom_segment(data = a[a$Distribution.!="Poisson",],
+               aes(x = 0, y=a[a$var.par==1,]$se.le,
+                   xend=a$Sample.rate[1], yend=a[a$var.par==1,]$se.le), color = "gray", size=0.05)+
+  geom_segment(data = a[a$Distribution.!="Poisson",],
+               aes(x = 0, y=a[a$var.par==2,]$se.le,
+                   xend=a$Sample.rate[1], yend=a[a$var.par==2,]$se.le), color = "gray", size=0.05)+
+  geom_segment(data = a[a$Distribution.!="Poisson",],
+               aes(x = 0, y=a[a$var.par==4,]$se.le,
+                   xend=a$Sample.rate[1], yend=a[a$var.par==4,]$se.le), color = "gray", size=0.0)+
+  
+  theme_bw()+
+  theme(legend.position = "right", legend.box = "vertical", legend.box.just = "top",
+        legend.justification = "left", legend.direction = "vertical", legend.box.spacing = unit(0, "cm"),
+        legend.spacing.y = unit(0.25,"cm"), legend.background = element_blank(),
+        axis.title.y = element_text(margin = margin(t = 0, r = 4, b = 0, l = 0, unit = "mm")))+
+  
+  labs(x="Sample rate",
+       y="standard error of OERR")
+```
+
+
+### 3. Simulate the effectiveness of using auxiliary variable in regression to increase accuracy of population estimation. 
+Linear estimator is used as a benchmark method.
+The standard error of OERR is used as an evaluation indicator.
+Results are visualized in the (Figure 3)
+In the paper, 1000 bootstrap iterations are used for simulation.
+In the following codes, I use only 10 bootstrap iterations to save the time. Please increase the bootstrap iterations to reproduce the results as in the paper.
+1 bootstrap, simulation includes 25*5  = 125 models
+Simulation would take 1 minutes for simulation with 1 bootstrap iterations
+```{r}
+t0 <- Sys.time()
+negbin.se_r <- lapply(as.list(seq(from =  0.01, to = 0.99, length.out = 25)), # the correlation coefficient, 0.01 denotes very weak (no) correlation
+                   function(r){
+                     r = r # the correlation coefficient
+                     obs <- 10000 # number of observations
+                     
+                     lamda <- c(65,2000) # mean of predictor and outcome, take information from dat2016.12k
+                     
+                     se_r <- list()
+                     for(j in list(0.01,0.10,1.00,2.00,4.00)){ # dispersion parametter d in negbin: 1e-6,0.01,0.10,1.00,2.00,4.00 (impose dispersion d too small may cause notification "Model convergence problem; non-positive-definite Hessian matrix". This notification may not effect the simulation results)
+                       dispersion <- c(j, j) # variance = mean + dispersion*mean^2; in the dat2016.12 dispersion = ~3.6
+                       
+                       dat <- genCorGen(obs, nvars = 2, params1 = lamda,
+                                      params2 = dispersion, dist = "negBinomial", 
+                                      rho = r, corstr = "cs", wide = TRUE)
+                       dat <- rename(dat, "predictor"="V1", "outcome"="V2", "Acc_code" = "id")
+                       # r <- cor(dat[,c(2,3)])[1,2]
+                       dat$predictor <- dat$predictor+1
+                       
+                       list1 <- lapply(as.list(seq(1:10)), # Number of Bootstrap replications in each sample rate i 
+                            function(h){
+                              h = h
+                              resam <- dat[sample(x = dat$Acc_code, size = nrow(dat), replace = FALSE),] 
+                              
+                              smp_size <- floor(0.2 * nrow(resam)) # training set = 20%
+                              ## set the seed to make your partition reproducible
+                              # set.seed(123)
+                              train_ind <- base::sample(seq_len(nrow(resam)), size = smp_size) # drawn n samples Without replacement
+                              train <- (resam)[train_ind, ]
+                              test <- (resam)[-train_ind, ]
+                              
+                              # m1.poi.fix: Poisson regression with fixed variance
+                              m1.poi.fix <- glmmTMB(outcome ~ I(log(predictor)),
+                                                    ziformula = ~ 0,
+                                                    dispformula = ~ I(log(predictor)),
+                                                    data = train, 
+                                                    family = nbinom2()) 
+                                
+                              
+                              test$m1.fitted <- predict(m1.poi.fix, newdata = test, type = "response")
+                              m1.est.guests = sum(test$m1.fitted)+sum(train$outcome)
+                              
+                              # Linear estimator
+                             
+                              linear.estimator = sum(train$outcome)/nrow(train)
+                              est.guests.LE = linear.estimator*nrow(test)+sum(train$outcome)
+                              
+                              observed.guests = sum(test$outcome)+sum(train$outcome)
+                              
+                              m.performance =cbind(dispersion = dispersion,
+                                                   correlation.coef = r,
+                                                   observed = observed.guests,
+                                                   
+                                                   # m1.est.guests = m1.est.guests,
+                                                   # m1.diff.guests = m1.est.guests - observed.guests,
+                                                   m1.diff.ratio = (m1.est.guests - observed.guests)*100/observed.guests,
+                                                   
+                                                   # LE.est.guests = est.guests.LE,
+                                                   # LE.diff.guests = est.guests.LE - observed.guests,
+                                                   LE.diff.ratio = (est.guests.LE - observed.guests)*100/observed.guests
+                                                     
+                                                   )
+                              m.performance
+                              
+                            })
+                       list1 <- do.call(rbind, list1)
+                       
+                       
+                       se_r[[as.character(j)]] <- list1
+                       }
+                     se_r <- as.data.frame(do.call(rbind, se_r))
+                     
+                     
+                     
+                     })
+negbin.se_r <- as.data.frame(do.call(rbind, negbin.se_r))
+t1 <- Sys.time()
+t1-t0 # Time consumed for the Simulation
+```
+The simulation results are visualized with following codes
+(Figure 3 in the paper)
+```{r}
+negbin.se <- negbin.se_r %>% 
+  group_by(dispersion, 
+           correlation.coef) %>% 
+  summarise(obs = n(),
+            se.reg = sd(m1.diff.ratio),
+            se.le = sd(LE.diff.ratio))
+
+
+negbin.se.plot <- negbin.se[,c(1,2,4,5)] %>% 
+  melt(., 
+       id.vars = c("dispersion", "correlation.coef"),
+       variable.name = "Model")
+negbin.se.plot$Model <- as.character(negbin.se.plot$Model)
+negbin.se.plot$Model[negbin.se.plot$Model=="se.reg"] <- "Regression"
+negbin.se.plot$Model[negbin.se.plot$Model=="se.le"] <- "Sample mean"
+
+negbin.se.plot$Distribution <- negbin.se.plot$dispersion
+
+negbin.se.plot[negbin.se.plot$dispersion==0.01,]$Distribution <- "NegBinomial, d = 0.01"
+negbin.se.plot[negbin.se.plot$dispersion==0.1,]$Distribution <- "NegBinomial, d = 0.1"
+negbin.se.plot[negbin.se.plot$dispersion==1,]$Distribution <- "NegBinomial, d = 1"
+negbin.se.plot[negbin.se.plot$dispersion==2,]$Distribution <- "NegBinomial, d = 2"
+negbin.se.plot[negbin.se.plot$dispersion==4,]$Distribution <- "NegBinomial, d = 4"
+
+ggplot(negbin.se.plot[negbin.se.plot$Distribution!="Poisson",])+
+  geom_line(aes(x =correlation.coef, y = value,linetype = Model, color = Distribution), size =0.75)+
+  scale_color_manual(name = "Distribution:",
+                       values = c("NegBinomial, d = 0.01"="#F8766D",
+                                  "NegBinomial, d = 0.1"="#7CAE00",
+                                  "NegBinomial, d = 1"="orange",
+                                  "NegBinomial, d = 2"="cyan", 
+                                  "NegBinomial, d = 4"="#C77CFF"))+
+  theme_bw()+
+  theme(axis.title.y = element_text(margin = margin(t = 0, r = 4, b = 0, l = 0, unit = "mm")))+
+  theme(axis.title.x = element_text(margin = margin(t = 2.5, r = 0, b = 0, l = 0, unit = "mm")))+
+  # theme(legend.position = "right", legend.box = "vertical", legend.box.just = "top",
+  #       legend.justification = "left", legend.direction = "vertical", legend.box.spacing = unit(0, "cm"),
+  #       legend.spacing.y = unit(0.25,"cm"), legend.background = element_blank() )+
+  
+  labs(x = "Correlation coefficient",
+       y = "standard error of OERR")
+```
+
+
+### 4. Estimation of population (total guests) with the tourism accommodation data in December 2016 in Japan.
+
+Loading the data:
+Please note that for the privacy reason, the data in this example contains only 1000 samples.
+(the full data is used in the paper)
+```{r}
+load("dat2016.12K.RData")
+```
+
+## 4.1 Explore the distribution of outcome variable (Table 1 in the paper)
+The dispersion parameter d ~ 3.69 suggesting that the data is highly over-dispersed. Therefore, it will highly affect the estimation of population total
+```{r}
+data.frame(Mean=sapply(na.omit(dat2016.12K[,c(5,2,3,4)]),mean),
+           Min = sapply(na.omit(dat2016.12K[,c(5,2,3,4)]),min),
+           Max = sapply(na.omit(dat2016.12K[,c(5,2,3,4)]),max),
+           Sd=sapply(na.omit(dat2016.12K[,c(5,2,3,4)]),sd))
+# Dispersion parameter d of the data is roughly estimated as:
+((sd(dat2016.12K$Guests.Persons))^2 - mean(dat2016.12K$Guests.Persons))/(mean(dat2016.12K$Guests.Persons)^2)
+
+```
+
+## 4.2 Utilise Pearson's correlation coefficient r to identify the auxiliary variable that most beneficial to the population total estimation 
+Figure 4 in the paper and 95%CI of Pearson's correlation coefficients
+```{r}
+pairs.panels(dat2016.12K[,c(5,2,3,4)], scale = TRUE, smooth = TRUE, pch = 1)
+
+# 95%CI of bivariate Pearson's correlation coefficients
+cor.test(dat2016.12K$Guests.Persons, dat2016.12K$Rooms, method = "pearson")$conf.int[1:2]
+cor.test(dat2016.12K$Guests.Persons, dat2016.12K$Capacity, method = "pearson")$conf.int[1:2]
+cor.test(dat2016.12K$Guests.Persons, dat2016.12K$Employees, method = "pearson")$conf.int[1:2]
+cor.test(dat2016.12K$Rooms, dat2016.12K$Capacity, method = "pearson")$conf.int[1:2]
+cor.test(dat2016.12K$Rooms, dat2016.12K$Employees, method = "pearson")$conf.int[1:2]
+cor.test(dat2016.12K$Capacity, dat2016.12K$Employees, method = "pearson")$conf.int[1:2]
+
+```
+
+## 4.3 Explore distribution of the outcome variable (guests)
+The codes below visualize the distribution of Guests.Persons (right panel in Figure 5)
+
+```{r}
+ggplot(data = dat2016.12K, aes(x = Guests.Persons)) + 
+  geom_histogram(binwidth = 10) + 
+  geom_point(aes(x = mean(Guests.Persons), y = 0), color = "darkred", size = 1)+ #This point denotes the mean value of the Guests.Person
+  # ggtitle("Distribution of guests staying at the 
+  # surveyed accommodation properties in December 2016") +
+  xlab("Number of guests (Persons/month)") +
+  ylab("Frequency") +
+  theme(panel.background = element_rect(fill = FALSE),
+        panel.grid.major = element_line(colour = "gray90"),
+        panel.grid.minor = element_blank(),
+        plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm")
+        )
+  
+```
+
+Figure 5 (full, including 3 panels)
+```{r}
+p <- ggplot(data = dat2016.12K, aes(x = Rooms, y = Guests.Persons)) + 
+  geom_point(shape = 1, color = "green")+
+  stat_smooth(formula = y ~ x, method = "loess")+
+  xlab("Rooms of the accommodation facility") +
+  ylab("Guests (persons)") +
+  theme(panel.background = element_rect(fill = FALSE), 
+        panel.grid.major = element_line(colour = "gray90"),
+        panel.grid.minor = element_blank()
+        ) 
+  
+ggExtra::ggMarginal(p, type = "histogram",  col = "darkgreen", fill="green", 
+                    xparams = list(binwidth = 10),  yparams = list(binwidth = 50))  
+```
+
+## 4.4 Comparison the effectiveness of (zero-inflated, over-dispersed, longtail count NB) regression with the benchmark method (linear estimator)
+
+The analysis procedure, which is presented in Figure 6 (in the paper), is done with the codes below 
+
+In the paper, the results are obtained with 2500 bootstrap iteration.
+Here, I use 25 bootstrap iterations to save the time. Please increase bootstrap iterations to reproduce the results as presented in the paper.
+It would take 10 minutes for 25 bootstrap iterations
+```{r}
+t0<-Sys.time()
+performance <- lapply(list(0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95), # The rate of training set 
+                   function(i){
+                     i = i # This is the rate of training set (which is presumed as survey sample)
+                     list1 <- lapply(as.list(seq(1:25)), # Number of Bootstrap replications in each sample rate i 
+                            function(h){
+                              h = h
+                              # Create bootstrap sample
+                              resam <- dat2016.12K[sample(x = nrow(dat2016.12K), 
+                                                          size = nrow(dat2016.12K), 
+                                                          replace = TRUE),]
+                              smp_size <- floor(i * nrow(resam))
+                              train_ind <- base::sample(seq_len(nrow(resam)), size = smp_size)
+                              # Drawn a training set of size n (sample rate i) with simple random sampling without replacement (SRSWOR)
+                              train <- (resam)[train_ind, ]
+                              # The test set will be used to validate the estimation
+                              test <- (resam)[-train_ind, ]
+                              
+                              # m12.HNB.vari: Hurdle negative binomial regression with varied variance
+                              m12.HNB.vari <- glmmTMB(Guests.Persons ~ I(log(Rooms)), # Logarithmic Rooms to make it the same scale with Guests.Persons. Because the link function in the logarithm form
+                                                    ziformula = ~ I(log(Rooms)), # zero-inflation as f(Rooms)
+                                                    dispformula = ~ I(log(Rooms)), # varied dispersion
+                                                    data = train, 
+                                                    family = truncated_nbinom2(link = "log")) 
+                              test$m12.fitted <- predict(m12.HNB.vari, newdata = test, type = "response")
+                              m12.est.guests = sum(test$m12.fitted)+sum(train$Guests.Persons)
+                              m12.AIC = AIC(m12.HNB.vari)
+                              m12.BIC = BIC(m12.HNB.vari)
+                              m12.LL = logLik(m12.HNB.vari)[1]
+                              
+                              # Linear estimator
+                              train.guests = sum(train$Guests.Persons)
+                              linear.estimator = sum(train$Guests.Persons)/nrow(train)
+                              est.guests.LE = linear.estimator*nrow(test)+sum(train$Guests.Persons)
+                              
+                              observed.guests = sum(test$Guests.Persons)+sum(train$Guests.Persons)
+                              
+                              m.performance =cbind(train.rate = i,
+                                                   observed.guests = observed.guests,
+                                                   m12.est.guests = m12.est.guests,
+                                                   # m12.diff.guests = m12.est.guests - observed.guests,
+                                                   m12.diff.ratio = (m12.est.guests - observed.guests)*100/observed.guests,
+                                                   m12.AIC = m12.AIC,
+                                                   m12.BIC = m12.BIC,
+                                                   m12.LL = m12.LL,
+                                                   
+                                                   LE.est.guests = est.guests.LE,
+                                                   # LE.diff.guests = est.guests.LE - observed.guests,
+                                                   LE.diff.ratio = (est.guests.LE - observed.guests)*100/observed.guests
+                                                     
+                                                   )
+                              m.performance
+                              
+                            })
+                     list1 <- do.call(rbind, list1)
+                     
+                     })
+performance <- as.data.frame(do.call(rbind, performance))
+Sys.time()-t0
+
+
+HNB.reg <- performance[,c("train.rate", "observed.guests", "m12.diff.ratio")]
+names(HNB.reg) <- c("train.rate", "observed.guests", "diff.ratio")
+HNB.reg$model <- rep("HNB", nrow(HNB.reg))
+
+LE <- performance[,c("train.rate", "observed.guests", "LE.diff.ratio")]
+names(LE) <- c("train.rate", "observed.guests", "diff.ratio")
+LE$model <- rep("LE", nrow(LE))
+performance_melt <- rbind(HNB.reg, LE)
+```
+
+# Visualize the bootstrap sampling distribution of OERR before the Bias correction
+```{r}
+performance_melt %>% 
+  ggplot()+
+  geom_density(aes(x=diff.ratio, colour = model, linetype = model))+
+  facet_wrap(~train.rate, scales = "free")+
+  theme_bw()+
+  theme(legend.position="right",plot.caption=element_text(hjust=0,size=8),
+        axis.title=element_text(size=10),
+        plot.title=element_text(size=13))+
+  labs(x="Relative ratio of estimated-to-observed guests (%)",
+       title="Density of relative ratio estimated-to-observed  by ratio of training set"
+       )
+```
+
+# Bias correction
+```{r}
+correct <- lapply(list(0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95),
+                   function(i){
+                     i = i
+                     correct.list <- list()
+                     for(j in list("HNB", "LE")) {# HNB.reg, Hurdle Negative binomial regression estimator; LE, Linear estimator 
+                       j = j
+                       estimate <- performance_melt[(performance_melt$train.rate==i & 
+                                                       performance_melt$model == j),]
+                       estimate$est.guests <- estimate$observed.guests*(1+estimate$diff.ratio/100)
+                       estimate$diff.guests <- estimate$est.guests-estimate$observed.guests 
+                       estimate$bias <- mean(estimate$diff.ratio)
+                       estimate$se <- sd(estimate$diff.ratio)
+                       # Test if se/bias <0.25? if this is satisfied, then that is fine to do correction 
+                       # (See P128, Introduction to the Bootstrap, Bradley Efron)
+                       estimate$se_bias <- estimate$bias /estimate$se
+                       estimate$est.guests_corrected <- estimate$est.guests*(1-estimate$bias/100)
+                       estimate$diff.ratio.corrected <- estimate$diff.ratio - estimate$bias
+                       estimate$lw2.5 <- quantile(estimate$diff.ratio.corrected, 0.025)
+                       estimate$lw0.5 <- quantile(estimate$diff.ratio.corrected, 0.5)
+                       estimate$lw97.5 <- quantile(estimate$diff.ratio.corrected, 0.975)
+                       correct.list[[j]] <- estimate
+                     } 
+                     
+                     correct.list <- as.data.frame(do.call(rbind, correct.list))
+                     })
+correct <- as.data.frame(do.call(rbind, correct))
+correct$model <- factor(correct$model, 
+                        levels = c("HNB", "LE"),
+                        labels = c("HNB", "LE"))
+corrected <- correct[correct$model!="LE",c(1,3,4)]
+corrected$Bias_correction <- "HNB WOBC"
+corrected2 <- correct[correct$model!="LE",c(1,11,4)]
+corrected2 <- rename(corrected2, "diff.ratio" = "diff.ratio.corrected")
+corrected2$Bias_correction <- "HNB WBC"
+performance.le <- performance_melt[performance_melt$model=="LE",c(1,3,4)]
+performance.le$Bias_correction <- "LE"
+performance.le$model <- as.factor(performance.le$model)
+correct.fn <- bind_rows(corrected,corrected2, performance.le)
+correct.fn <- rename(correct.fn, "Model" = "model")
+
+```
+
+# Visualize the results after the Bias correction, figure 8
+```{r}
+ggplot(data = correct.fn, aes(x=diff.ratio, group = Bias_correction))+
+  geom_density(aes(colour = Bias_correction, linetype = Bias_correction,
+                   fill = Bias_correction, size = Bias_correction))+ 
+  scale_color_manual(values = c("#F8766D","#F8766D", "#00BFC4", "#C77CFF"))+
+  scale_fill_manual(values = alpha(c("#F8766D","#F8766D", "#00BFC4", "#C77CFF"), .01))+
+  scale_linetype_manual(values = c("solid", "dashed", "solid", "solid"))+
+  labs(colour="Legend:")+ # Legend title
+  labs(linetype="Legend:")+
+  labs(fill="Legend:")+
+  labs(size="Legend:")+
+  scale_size_manual(values = c(1.0, 0.25, 0.5, 0.5))+
+  facet_wrap(~train.rate, scales = "free")+
+  theme_bw()+
+  
+  theme(legend.position="right", 
+        plot.caption=element_text(hjust=0,size=8),
+        axis.title=element_text(size=10),
+        plot.title=element_text(size=13),
+        panel.grid.minor = element_blank())+
+  labs(x="", y="",title="")
+
+```
+
+
+
